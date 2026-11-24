@@ -1,10 +1,14 @@
-"""Одноразовий запуск: забирає нові пости з каналу-джерела і копіює у ваш канал.
-Запускається за розкладом у GitHub Actions. Стан (id останнього поста) у state.json."""
+"""Цикл на ~4,5 хв: кожні POLL_INTERVAL секунд перевіряє джерело й копіює нові пости.
+Запускається в GitHub Actions; наприкінці workflow запускає наступне коло.
+Стан (id останнього поста) зберігається в state.json.
+Коди виходу: 0 - все гаразд, 2 - фатальна помилка налаштувань (ланцюжок зупиняється)."""
 import asyncio
 import json
 import logging
 import os
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from telethon import TelegramClient
@@ -15,17 +19,12 @@ from telethon.tl.types import MessageMediaWebPage
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION = "".join(os.environ["TG_SESSION"].split())  # прибираємо випадкові пробіли/переноси
-SOURCE = os.environ.get("SOURCE_CHANNEL", "nebo_raketa").lstrip("@")
+SOURCE = os.environ.get("SOURCE_CHANNEL", "nebo_raketa").strip().lstrip("@")
 TARGET_RAW = os.environ["TARGET_CHAT"].strip()
 ADD_SOURCE_LINK = os.environ.get("ADD_SOURCE_LINK", "1") == "1"
-
-if len(SESSION) not in (353, 369):
-    print(
-        f"ПОМИЛКА: секрет TG_SESSION має довжину {len(SESSION)}, а має бути 353. "
-        "Рядок скопійовано не повністю або з зайвим текстом. "
-        "Створіть сесію заново (create_session.bat) і вставте вміст файлу session_string.txt."
-    )
-    sys.exit(1)
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
+SETTLE_SECONDS = int(os.environ.get("SETTLE_SECONDS", "4"))  # чекаємо, поки допише весь альбом
 
 TARGET = int(TARGET_RAW) if TARGET_RAW.lstrip("-").isdigit() else TARGET_RAW
 STATE = Path("state.json")
@@ -34,9 +33,13 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 log = logging.getLogger("poll")
 
 
+class Fatal(Exception):
+    """Помилка налаштувань: повторні запуски не допоможуть."""
+
+
 def load_state():
     if STATE.exists():
-        return json.loads(STATE.read_text())
+        return json.loads(STATE.read_text()).get("last_id")
     return None
 
 
@@ -54,7 +57,7 @@ async def with_retry(factory, retries=3):
             return await factory()
         except FloodWaitError as e:
             log.warning("FloodWait %s c", e.seconds)
-            await asyncio.sleep(e.seconds + 1)
+            await asyncio.sleep(min(e.seconds + 1, 60))
     raise RuntimeError("Не вдалося відправити після кількох спроб")
 
 
@@ -81,48 +84,76 @@ async def send_batch(client, batch):
     )
 
 
-async def main():
+async def poll_once(client, last_id: int) -> int:
+    msgs = [m async for m in client.iter_messages(SOURCE, min_id=last_id, reverse=True, limit=100)]
+
+    # не чіпаємо надто свіжі пости: альбом може ще дописуватися
+    now = datetime.now(timezone.utc)
+    ready = []
+    for m in msgs:
+        if (now - m.date).total_seconds() < SETTLE_SECONDS:
+            break
+        ready.append(m)
+
+    batches = []
+    for m in ready:
+        if m.grouped_id and batches and batches[-1][0].grouped_id == m.grouped_id:
+            batches[-1].append(m)
+        else:
+            batches.append([m])
+
+    for batch in batches:
+        await send_batch(client, batch)
+        last_id = batch[-1].id
+        save_state(last_id)
+        log.info("Переслано до id %s", last_id)
+    return last_id
+
+
+async def run():
+    if len(SESSION) not in (353, 369):
+        raise Fatal(f"TG_SESSION має довжину {len(SESSION)}, а має бути 353. Створіть сесію заново.")
+
     client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
     await client.connect()
     try:
         if not await client.is_user_authorized():
-            log.error("Сесія недійсна. Створіть нову через make_session.py і оновіть секрет TG_SESSION.")
-            sys.exit(1)
-
+            raise Fatal("Сесія недійсна. Створіть нову (create_session.bat) і оновіть секрет TG_SESSION.")
         me = await client.get_me()
         if me.bot:
-            log.error("Сесія належить БОТУ. Боти не можуть читати чужі канали. "
-                      "Створіть сесію для звичайного акаунта з номером телефону (create_session.bat).")
-            sys.exit(1)
+            raise Fatal("Сесія належить БОТУ. Потрібен звичайний акаунт з номером телефону.")
 
-        state = load_state()
-        if state is None:
+        last_id = load_state()
+        if last_id is None:
             latest = await client.get_messages(SOURCE, limit=1)
-            save_state(latest[0].id if latest else 0)
-            log.info("Перший запуск: запам'ятав останній пост, нічого не публікую.")
-            return
-
-        last_id = state["last_id"]
-        msgs = [m async for m in client.iter_messages(SOURCE, min_id=last_id, reverse=True, limit=100)]
-        if not msgs:
-            log.info("Нових постів немає.")
-            return
-
-        batches = []
-        for m in msgs:
-            if m.grouped_id and batches and batches[-1][0].grouped_id == m.grouped_id:
-                batches[-1].append(m)
-            else:
-                batches.append([m])
-
-        for batch in batches:
-            await send_batch(client, batch)
-            last_id = batch[-1].id
+            last_id = latest[0].id if latest else 0
             save_state(last_id)
-            log.info("Переслано до id %s", last_id)
+            log.info("Перший запуск: запам'ятав останній пост (id %s), старі не публікую.", last_id)
+
+        deadline = time.monotonic() + RUN_SECONDS
+        while True:
+            try:
+                last_id = await poll_once(client, last_id)
+            except FloodWaitError as e:
+                log.warning("FloodWait під час опитування: %s c", e.seconds)
+                await asyncio.sleep(min(e.seconds + 1, 60))
+            except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                log.warning("Мережева помилка: %s", e)
+            if time.monotonic() + POLL_INTERVAL >= deadline:
+                break
+            await asyncio.sleep(POLL_INTERVAL)
+        log.info("Коло завершено. Останній id: %s", last_id)
     finally:
         await client.disconnect()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(run())
+    except Fatal as e:
+        log.error("ФАТАЛЬНО: %s", e)
+        sys.exit(2)
+    except Exception:
+        log.exception("Тимчасова помилка, наступне коло спробує ще раз")
+        time.sleep(20)
+        sys.exit(0)
