@@ -2,20 +2,21 @@ name: Repost
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+    - cron: "*/15 * * * *"   # страховка: перезапустити ланцюжок, якщо він урветься
+  workflow_dispatch:          # ручний запуск і самозапуск наступного кола
 
 permissions:
-  contents: write
+  contents: write             # зберігати state.json
+  actions: write              # запускати наступне коло
 
 concurrency:
-  group: repost
+  group: tg-repost
   cancel-in-progress: false
 
 jobs:
   repost:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
@@ -26,7 +27,8 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Run reposter
+      - name: Run repost (коло ~4,5 хв, опитування кожні 10 с)
+        id: run
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -34,14 +36,25 @@ jobs:
           SOURCE_CHANNEL: ${{ secrets.SOURCE_CHANNEL }}
           TARGET_CHAT: ${{ secrets.TARGET_CHAT }}
           ADD_SOURCE_LINK: "1"
+          RUN_SECONDS: "270"
+          POLL_INTERVAL: "10"
         run: python poll.py
 
       - name: Save state
+        if: always()
         run: |
           if [ -n "$(git status --porcelain state.json)" ]; then
-            git config user.name "github-actions"
-            git config user.email "github-actions@users.noreply.github.com"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add state.json
-            git commit -m "update state"
+            git commit -m "update state [skip ci]"
+            git pull --rebase origin ${{ github.ref_name }} || true
             git push
           fi
+
+      - name: Start next run
+        if: always() && steps.run.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run poll.yml --ref ${{ github.ref_name }}
