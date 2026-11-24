@@ -14,10 +14,18 @@ from telethon.tl.types import MessageMediaWebPage
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-SESSION = os.environ["TG_SESSION"]
+SESSION = "".join(os.environ["TG_SESSION"].split())  # прибираємо випадкові пробіли/переноси
 SOURCE = os.environ.get("SOURCE_CHANNEL", "nebo_raketa").lstrip("@")
 TARGET_RAW = os.environ["TARGET_CHAT"].strip()
 ADD_SOURCE_LINK = os.environ.get("ADD_SOURCE_LINK", "1") == "1"
+
+if len(SESSION) not in (353, 369):
+    print(
+        f"ПОМИЛКА: секрет TG_SESSION має довжину {len(SESSION)}, а має бути 353. "
+        "Рядок скопійовано не повністю або з зайвим текстом. "
+        "Створіть сесію заново (create_session.bat) і вставте вміст файлу session_string.txt."
+    )
+    sys.exit(1)
 
 TARGET = int(TARGET_RAW) if TARGET_RAW.lstrip("-").isdigit() else TARGET_RAW
 STATE = Path("state.json")
