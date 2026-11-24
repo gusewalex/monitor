@@ -19,7 +19,7 @@ from telethon.tl.types import MessageMediaWebPage
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION = "".join(os.environ["TG_SESSION"].split())  # прибираємо випадкові пробіли/переноси
-SOURCE = os.environ.get("SOURCE_CHANNEL", "kievinform_ua1").strip().lstrip("@")
+SOURCE = os.environ.get("SOURCE_CHANNEL", "nebo_raketa").strip().lstrip("@")
 TARGET_RAW = os.environ["TARGET_CHAT"].strip()
 ADD_SOURCE_LINK = os.environ.get("ADD_SOURCE_LINK", "1") == "1"
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))
