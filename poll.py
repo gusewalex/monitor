@@ -89,6 +89,12 @@ async def main():
             log.error("Сесія недійсна. Створіть нову через make_session.py і оновіть секрет TG_SESSION.")
             sys.exit(1)
 
+        me = await client.get_me()
+        if me.bot:
+            log.error("Сесія належить БОТУ. Боти не можуть читати чужі канали. "
+                      "Створіть сесію для звичайного акаунта з номером телефону (create_session.bat).")
+            sys.exit(1)
+
         state = load_state()
         if state is None:
             latest = await client.get_messages(SOURCE, limit=1)
