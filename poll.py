@@ -25,9 +25,16 @@ ADD_SOURCE_LINK = os.environ.get("ADD_SOURCE_LINK", "1") == "1"
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 SETTLE_SECONDS = int(os.environ.get("SETTLE_SECONDS", "4"))  # чекаємо, поки допише весь альбом
+MAX_FAILS = int(os.environ.get("MAX_FAILS", "3"))  # скільки разів пробувати «битий» пост, перш ніж пропустити
 
 TARGET = int(TARGET_RAW) if TARGET_RAW.lstrip("-").isdigit() else TARGET_RAW
 STATE = Path("state.json")
+
+CAPTION_LIMIT = 1024   # для Premium-акаунта стане 2048 (див. run)
+MESSAGE_LIMIT = 4096
+CHUNK_SIZE = 2000      # розмір шматка для дуже довгих текстів (з запасом)
+
+FAILS: dict[int, int] = {}  # id першого повідомлення батча -> кількість невдач
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("poll")
@@ -51,6 +58,11 @@ def footer(msg) -> str:
     return f"\n\nДжерело: https://t.me/{SOURCE}/{msg.id}" if ADD_SOURCE_LINK else ""
 
 
+def tlen(s: str) -> int:
+    """Довжина в UTF-16 (так Telegram рахує символи); з запасом, щоб не ризикувати."""
+    return len(s.encode("utf-16-le")) // 2
+
+
 async def with_retry(factory, retries=3):
     for _ in range(retries):
         try:
@@ -61,27 +73,48 @@ async def with_retry(factory, retries=3):
     raise RuntimeError("Не вдалося відправити після кількох спроб")
 
 
-async def send_batch(client, batch):
-    if len(batch) > 1:  # альбом
-        media = [m.media for m in batch if m.media]
-        caption = next((m.raw_text for m in batch if m.raw_text), "") + footer(batch[0])
-        await with_retry(lambda: client.send_file(TARGET, media, caption=caption))
+async def send_text(client, text: str, entities=None):
+    """Текстове повідомлення. Якщо задовге, ріжемо на шматки (без форматування)."""
+    if tlen(text) <= MESSAGE_LIMIT:
+        await with_retry(
+            lambda: client.send_message(
+                TARGET, text, formatting_entities=entities, parse_mode=None, link_preview=False
+            )
+        )
         return
+    for i in range(0, len(text), CHUNK_SIZE):
+        chunk = text[i:i + CHUNK_SIZE]
+        await with_retry(
+            lambda c=chunk: client.send_message(TARGET, c, parse_mode=None, link_preview=False)
+        )
 
-    msg = batch[0]
-    media = None if isinstance(msg.media, MessageMediaWebPage) else msg.media
-    text = msg.raw_text or ""
+
+async def send_batch(client, batch):
+    src = next((m for m in batch if m.raw_text), None)  # повідомлення з текстом
+    text = src.raw_text if src else ""
+    entities = src.entities if src else None
+    media = [m.media for m in batch if m.media and not isinstance(m.media, MessageMediaWebPage)]
+
     if not text and not media:
         return
-    await with_retry(
-        lambda: client.send_message(
-            TARGET,
-            text + footer(msg),
-            file=media,
-            formatting_entities=msg.entities,
-            link_preview=False,
+
+    full = text + footer(batch[0])
+
+    if not media:
+        await send_text(client, full, entities)
+        return
+
+    files = media if len(media) > 1 else media[0]
+    if tlen(full) <= CAPTION_LIMIT:
+        await with_retry(
+            lambda: client.send_file(
+                TARGET, files, caption=full, formatting_entities=entities, parse_mode=None
+            )
         )
-    )
+    else:
+        # підпис задовгий: спершу медіа, потім текст окремим повідомленням
+        await with_retry(lambda: client.send_file(TARGET, files))
+        await send_text(client, full, entities)
 
 
 async def poll_once(client, last_id: int) -> int:
@@ -103,14 +136,30 @@ async def poll_once(client, last_id: int) -> int:
             batches.append([m])
 
     for batch in batches:
-        await send_batch(client, batch)
+        key = batch[0].id
+        try:
+            await send_batch(client, batch)
+        except (FloodWaitError, ConnectionError, OSError, asyncio.TimeoutError):
+            raise  # тимчасові проблеми: обробляються у run()
+        except Exception:
+            FAILS[key] = FAILS.get(key, 0) + 1
+            log.exception("Не вдалося переслати пост %s (спроба %s/%s)", key, FAILS[key], MAX_FAILS)
+            if FAILS[key] < MAX_FAILS:
+                return last_id  # спробуємо ще на наступному опитуванні
+            # здаємося, щоб один пост не блокував усю чергу
+            log.error("Пропускаю пост %s", key)
+            try:
+                await send_text(client, f"Не вдалося переслати пост: https://t.me/{SOURCE}/{key}")
+            except Exception:
+                log.exception("Не вдалося надіслати навіть повідомлення про пропуск")
         last_id = batch[-1].id
         save_state(last_id)
-        log.info("Переслано до id %s", last_id)
+        log.info("Оброблено до id %s", last_id)
     return last_id
 
 
 async def run():
+    global CAPTION_LIMIT
     if len(SESSION) not in (353, 369):
         raise Fatal(f"TG_SESSION має довжину {len(SESSION)}, а має бути 353. Створіть сесію заново.")
 
@@ -122,6 +171,9 @@ async def run():
         me = await client.get_me()
         if me.bot:
             raise Fatal("Сесія належить БОТУ. Потрібен звичайний акаунт з номером телефону.")
+        if getattr(me, "premium", False):
+            CAPTION_LIMIT = 2048
+        log.info("Ліміт підпису: %s", CAPTION_LIMIT)
 
         last_id = load_state()
         if last_id is None:
